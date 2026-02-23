@@ -143,6 +143,54 @@ impl Default for SecurityPolicy {
     }
 }
 
+/// Replace the content inside single- and double-quoted strings with
+/// underscores so that operator checks (`>`, `$()`, `` ` ``, `&`, etc.)
+/// only fire on **unquoted** portions of the command.
+///
+/// This matches real shell semantics: characters inside quotes are literal
+/// arguments, not operators.  Escaped quotes (`\"`, `\'`) inside a quoted
+/// region are handled by advancing past the backslash.
+///
+/// If the command has an unterminated quote the original string is returned
+/// unchanged — this is a conservative fallback that keeps the existing
+/// strict checks active.
+fn strip_quoted_content(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            out.push(quote);
+            let mut terminated = false;
+            while let Some(inner) = chars.next() {
+                if inner == '\\' && quote == '"' {
+                    // In double-quotes, backslash escapes the next char.
+                    out.push('_'); // mask the backslash
+                    if chars.peek().is_some() {
+                        chars.next();
+                        out.push('_'); // mask the escaped char
+                    }
+                } else if inner == quote {
+                    out.push(quote);
+                    terminated = true;
+                    break;
+                } else {
+                    out.push('_'); // mask literal content
+                }
+            }
+            if !terminated {
+                // Unterminated quote → return original to stay strict.
+                return command.to_string();
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
@@ -357,25 +405,30 @@ impl SecurityPolicy {
             return false;
         }
 
+        // Strip quoted content so operator checks only fire on unquoted
+        // portions.  Characters inside quotes are literal arguments, not
+        // shell operators.
+        let unquoted = strip_quoted_content(command);
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-        if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
-            || command.contains("<(")
-            || command.contains(">(")
+        if unquoted.contains('`')
+            || unquoted.contains("$(")
+            || unquoted.contains("${")
+            || unquoted.contains("<(")
+            || unquoted.contains(">(")
         {
             return false;
         }
 
         // Block output redirections — they can write to arbitrary paths
-        if command.contains('>') {
+        if unquoted.contains('>') {
             return false;
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
         // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
+        if unquoted
             .split_whitespace()
             .any(|w| w == "tee" || w.ends_with("/tee"))
         {
@@ -384,7 +437,7 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_single_ampersand(command) {
+        if contains_single_ampersand(&unquoted) {
             return false;
         }
 
@@ -415,16 +468,20 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
+            let wildcard = self.allowed_commands.iter().any(|a| a == "*");
+            if !wildcard
+                && !self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| allowed == base_cmd)
             {
                 return false;
             }
 
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            // Validate arguments for the command.
+            // Preserve original case: git's `-c` (config injection) and `-C`
+            // (change directory) are distinct, case-sensitive flags.
+            let args: Vec<String> = words.map(|w| w.to_string()).collect();
             if !self.is_args_safe(base_cmd, &args) {
                 return false;
             }
@@ -440,6 +497,9 @@ impl SecurityPolicy {
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
+    ///
+    /// Args are passed in their **original case** because some flags are
+    /// case-sensitive (e.g. git `-c` vs `-C`).
     fn is_args_safe(&self, base: &str, args: &[String]) -> bool {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
@@ -449,12 +509,17 @@ impl SecurityPolicy {
             }
             "git" => {
                 // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
+                // (e.g. git -c core.sshCommand="evil" pull)
+                //
+                // IMPORTANT: `-c` (lowercase) sets a config key=value and is
+                // dangerous. `-C` (uppercase) changes the working directory
+                // and is safe. These are distinct, case-sensitive flags.
                 !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
+                    let lower = arg.to_ascii_lowercase();
+                    lower == "config"
+                        || lower.starts_with("config.")
+                        || lower == "alias"
+                        || lower.starts_with("alias.")
                         || arg == "-c"
                 })
             }
@@ -522,7 +587,12 @@ impl SecurityPolicy {
 
     /// Validate that a resolved path is still inside the workspace.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
+    /// When `workspace_only` is false, any resolved path is allowed (the user
+    /// explicitly opted out of workspace confinement).
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        if !self.workspace_only {
+            return true;
+        }
         // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -569,12 +639,12 @@ impl SecurityPolicy {
     /// Returns `true` if the action is allowed, `false` if rate-limited.
     pub fn record_action(&self) -> bool {
         let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        self.max_actions_per_hour == 0 || count <= self.max_actions_per_hour as usize
     }
 
     /// Check if the rate limit would be exceeded without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        self.max_actions_per_hour > 0 && self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
     /// Build from config sections
@@ -608,6 +678,15 @@ mod tests {
     fn readonly_policy() -> SecurityPolicy {
         SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    fn wildcard_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         }
     }
@@ -671,9 +750,13 @@ mod tests {
     #[test]
     fn enforce_tool_operation_act_uses_rate_budget() {
         let p = SecurityPolicy {
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             ..default_policy()
         };
+        // First action is allowed (count=1, limit=1)
+        p.enforce_tool_operation(ToolOperation::Act, "memory_store")
+            .unwrap();
+        // Second action exceeds rate limit
         let err = p
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
             .unwrap_err();
@@ -1101,6 +1184,10 @@ mod tests {
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
         assert!(p.is_command_allowed("git add ."));
+        // git -C (change directory) is safe; git -c (config injection) is not
+        assert!(p.is_command_allowed("git -C repos/my-project pull origin main"));
+        assert!(p.is_command_allowed("git -C /some/path log --oneline -5"));
+        assert!(!p.is_command_allowed("git -c core.sshCommand=evil pull"));
     }
 
     #[test]
@@ -1198,12 +1285,15 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_zero_blocks_everything() {
+    fn rate_limit_zero_means_unlimited() {
         let p = SecurityPolicy {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         };
-        assert!(!p.record_action());
+        // 0 = unlimited: all actions should be allowed
+        for _ in 0..100 {
+            assert!(p.record_action());
+        }
     }
 
     #[test]
@@ -1428,6 +1518,41 @@ mod tests {
     }
 
     #[test]
+    fn resolved_path_allows_outside_when_not_workspace_only() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_resolved_not_ws_only");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let policy = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        };
+
+        // Path outside workspace should be allowed when workspace_only=false
+        let canonical_temp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let outside = canonical_temp.join("outside_workspace_zeroclaw");
+        assert!(
+            policy.is_resolved_path_allowed(&outside),
+            "workspace_only=false must allow paths outside workspace"
+        );
+
+        // Path inside workspace should still be allowed too
+        let inside = canonical_workspace.join("file.txt");
+        assert!(
+            policy.is_resolved_path_allowed(&inside),
+            "workspace_only=false must still allow paths inside workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn resolved_path_blocks_root_escape() {
         let policy = SecurityPolicy {
             workspace_dir: PathBuf::from("/home/zeroclaw_user/project"),
@@ -1496,5 +1621,97 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    // ── strip_quoted_content ─────────────────────────────────
+
+    #[test]
+    fn strip_quoted_content_masks_double_quotes() {
+        let result = strip_quoted_content(r#"echo "hello > world""#);
+        assert!(!result.contains('>'), "content inside double quotes must be masked");
+        assert!(result.starts_with("echo \""));
+    }
+
+    #[test]
+    fn strip_quoted_content_masks_single_quotes() {
+        let result = strip_quoted_content("echo 'hello > world'");
+        assert!(!result.contains('>'), "content inside single quotes must be masked");
+    }
+
+    #[test]
+    fn strip_quoted_content_preserves_unquoted_operators() {
+        let result = strip_quoted_content("echo test > file.txt");
+        assert!(result.contains('>'), "unquoted > must be preserved");
+    }
+
+    #[test]
+    fn strip_quoted_content_handles_escaped_quotes() {
+        let result = strip_quoted_content(r#"echo "hello \"world\" > foo""#);
+        assert!(!result.contains('>'), "escaped quotes inside double quotes must not end the string");
+    }
+
+    #[test]
+    fn strip_quoted_content_unterminated_returns_original() {
+        let input = r#"echo "unterminated"#;
+        let result = strip_quoted_content(input);
+        assert_eq!(result, input, "unterminated quote must return original");
+    }
+
+    #[test]
+    fn strip_quoted_content_no_quotes() {
+        let input = "ls -la";
+        let result = strip_quoted_content(input);
+        assert_eq!(result, input, "no quotes must return identical string");
+    }
+
+    // ── Quoted content in is_command_allowed ─────────────────
+
+    #[test]
+    fn command_with_quoted_redirect_allowed() {
+        let p = wildcard_policy();
+        // The > is inside double quotes — not a real redirect
+        assert!(p.is_command_allowed(r#"bash script.sh --prompt "implement feature X > Y""#));
+    }
+
+    #[test]
+    fn command_with_quoted_ampersand_allowed() {
+        let p = wildcard_policy();
+        // The & is inside double quotes — not a real background operator
+        assert!(p.is_command_allowed(r#"bash script.sh --prompt "fix A & B""#));
+    }
+
+    #[test]
+    fn command_with_quoted_dollar_brace_allowed() {
+        let p = wildcard_policy();
+        // The ${ is inside double quotes — not a real expansion
+        assert!(p.is_command_allowed(r#"bash script.sh --prompt "check ${var} syntax""#));
+    }
+
+    #[test]
+    fn command_with_quoted_backtick_allowed() {
+        let p = wildcard_policy();
+        // The backtick is inside single quotes — not a real subshell
+        assert!(p.is_command_allowed("bash script.sh --prompt 'use `command` here'"));
+    }
+
+    #[test]
+    fn command_with_unquoted_redirect_still_blocked() {
+        let p = wildcard_policy();
+        // The > is NOT inside quotes — real redirect, must be blocked
+        assert!(!p.is_command_allowed("echo secret > /tmp/file"));
+    }
+
+    #[test]
+    fn command_with_unquoted_dollar_paren_still_blocked() {
+        let p = wildcard_policy();
+        assert!(!p.is_command_allowed("echo $(whoami)"));
+    }
+
+    #[test]
+    fn runner_style_command_allowed() {
+        let p = wildcard_policy();
+        // Simulates a real runner command with complex prompt in quotes
+        let cmd = r#"runners/claude-task.sh --daemon --repo Owner/repo --task custom --prompt "You are working on project X. Implement feature Y > Z & add tests. Use ${PROJECT_NAME} convention." --branch "feat/testing""#;
+        assert!(p.is_command_allowed(cmd));
     }
 }
