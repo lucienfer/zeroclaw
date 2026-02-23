@@ -387,11 +387,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let security = test_security_with(dir.clone(), AutonomyLevel::Supervised, 1);
+        security.record_action();
+        let tool = FileWriteTool::new(security);
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await

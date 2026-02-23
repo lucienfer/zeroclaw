@@ -205,9 +205,10 @@ mod tests {
     async fn store_blocked_when_rate_limited() {
         let (_tmp, mem) = test_mem();
         let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
+        limited.record_action();
         let tool = MemoryStoreTool::new(mem.clone(), limited);
         let result = tool
             .execute(json!({"key": "lang", "content": "Prefers Rust"}))

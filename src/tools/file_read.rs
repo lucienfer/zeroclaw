@@ -246,11 +246,9 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileReadTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let security = test_security_with(dir.clone(), AutonomyLevel::Supervised, 1);
+        security.record_action();
+        let tool = FileReadTool::new(security);
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(!result.success);

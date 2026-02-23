@@ -6,8 +6,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Default shell command execution time before kill.
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
@@ -20,11 +20,23 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    timeout_secs: u64,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self { security, runtime }
+        Self {
+            security,
+            runtime,
+            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
+        if timeout_secs > 0 {
+            self.timeout_secs = timeout_secs;
+        }
+        self
     }
 }
 
@@ -117,8 +129,8 @@ impl Tool for ShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let timeout = self.timeout_secs;
+        let result = tokio::time::timeout(Duration::from_secs(timeout), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -153,9 +165,7 @@ impl Tool for ShellTool {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
-                )),
+                error: Some(format!("Command timed out after {timeout}s and was killed")),
             }),
         }
     }
@@ -370,8 +380,25 @@ mod tests {
     // ── §5.2 Shell timeout enforcement tests ─────────────────
 
     #[test]
-    fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+    fn shell_default_timeout_is_300s() {
+        assert_eq!(
+            DEFAULT_SHELL_TIMEOUT_SECS, 300,
+            "default shell timeout must be 300 seconds"
+        );
+    }
+
+    #[test]
+    fn shell_with_timeout_overrides_default() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_timeout(120);
+        assert_eq!(tool.timeout_secs, 120);
+    }
+
+    #[test]
+    fn shell_with_timeout_zero_keeps_default() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_timeout(0);
+        assert_eq!(tool.timeout_secs, DEFAULT_SHELL_TIMEOUT_SECS);
     }
 
     #[test]
@@ -415,10 +442,11 @@ mod tests {
     async fn shell_blocks_rate_limited() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
+        security.record_action();
         let tool = ShellTool::new(security, test_runtime());
         let result = tool.execute(json!({"command": "echo test"})).await.unwrap();
         assert!(!result.success);

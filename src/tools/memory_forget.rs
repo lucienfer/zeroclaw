@@ -163,9 +163,10 @@ mod tests {
             .await
             .unwrap();
         let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
+        limited.record_action();
         let tool = MemoryForgetTool::new(mem.clone(), limited);
         let result = tool.execute(json!({"key": "temp"})).await.unwrap();
         assert!(!result.success);

@@ -70,16 +70,18 @@ use std::sync::Arc;
 
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
-    default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
+    default_tools_with_runtime(security, Arc::new(NativeRuntime::new()), 0)
 }
 
 /// Create the default tool registry with explicit runtime adapter.
+/// `shell_timeout_secs` of 0 uses the built-in default.
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
+    shell_timeout_secs: u64,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(security.clone(), runtime).with_timeout(shell_timeout_secs)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security)),
     ]
@@ -133,7 +135,10 @@ pub fn all_tools_with_runtime(
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(
+            ShellTool::new(security.clone(), runtime)
+                .with_timeout(root_config.agent.shell_timeout_secs),
+        ),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(CronAddTool::new(config.clone(), security.clone())),

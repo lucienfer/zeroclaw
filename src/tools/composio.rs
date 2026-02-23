@@ -21,7 +21,9 @@ const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https");
+        anyhow::bail!(
+            "Refusing to transmit sensitive data over non-HTTPS URL: URL scheme must be https"
+        );
     }
     Ok(())
 }
@@ -871,9 +873,10 @@ mod tests {
     #[tokio::test]
     async fn execute_blocked_when_rate_limited() {
         let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
+        limited.record_action();
         let tool = ComposioTool::new("test-key", None, limited);
         let result = tool
             .execute(json!({

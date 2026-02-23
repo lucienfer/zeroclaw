@@ -478,9 +478,10 @@ mod tests {
     #[tokio::test]
     async fn delegation_blocked_when_rate_limited() {
         let limited = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
+            max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
+        limited.record_action();
         let tool = DelegateTool::new(sample_agents(), None, limited);
         let result = tool
             .execute(json!({"agent": "researcher", "prompt": "test"}))
