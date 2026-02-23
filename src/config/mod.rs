@@ -43,8 +43,12 @@ mod tests {
             bot_token: "token".into(),
             guild_id: Some("123".into()),
             allowed_users: vec![],
+            allowed_channels: vec![],
             listen_to_bots: false,
             mention_only: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            transcription_url: None,
         };
 
         let lark = LarkConfig {

@@ -276,8 +276,10 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 dc.bot_token.clone(),
                 dc.guild_id.clone(),
                 dc.allowed_users.clone(),
+                dc.allowed_channels.clone(),
                 dc.listen_to_bots,
                 dc.mention_only,
+                None,
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
@@ -599,9 +601,10 @@ mod tests {
     async fn run_job_command_blocks_rate_limited() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        config.autonomy.max_actions_per_hour = 0;
+        config.autonomy.max_actions_per_hour = 1;
         let job = test_job("echo should-not-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        security.record_action();
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);

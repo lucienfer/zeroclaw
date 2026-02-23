@@ -254,6 +254,14 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// When false, tools are injected as XML instructions in the system prompt
+    /// instead of using the provider's native function-calling API. Useful for
+    /// proxies that rename tool names (e.g. CLIProxy adding `proxy_` prefix).
+    #[serde(default = "default_true")]
+    pub native_tools: bool,
+    /// Shell command timeout in seconds. 0 means use the default (300s).
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -268,6 +276,10 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_shell_timeout_secs() -> u64 {
+    300
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -276,6 +288,8 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            native_tools: true,
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }
@@ -2052,6 +2066,11 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// Restrict the bot to specific channel IDs.
+    /// Empty list means all channels are allowed.
+    /// When set, only messages from these channels are processed.
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
     /// When true, process messages from other bots (not just humans).
     /// The bot still ignores its own messages to prevent feedback loops.
     #[serde(default)]
@@ -2060,6 +2079,17 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Streaming mode for progressive response delivery via message edits.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits to avoid rate limits.
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// OpenAI-compatible Whisper API endpoint for voice message transcription.
+    /// Example: "http://100.x.x.x:8787/v1/audio/transcriptions"
+    /// When set, Discord voice messages are automatically transcribed.
+    #[serde(default)]
+    pub transcription_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3626,8 +3656,12 @@ tool_dispatcher = "xml"
             bot_token: "discord-token".into(),
             guild_id: Some("12345".into()),
             allowed_users: vec![],
+            allowed_channels: vec![],
             listen_to_bots: false,
             mention_only: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            transcription_url: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -3641,12 +3675,24 @@ tool_dispatcher = "xml"
             bot_token: "tok".into(),
             guild_id: None,
             allowed_users: vec![],
+            allowed_channels: vec![],
             listen_to_bots: false,
             mention_only: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            transcription_url: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.guild_id.is_none());
+    }
+
+    #[test]
+    fn discord_config_defaults_stream_off() {
+        let json = r#"{"bot_token":"tok"}"#;
+        let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.stream_mode, StreamMode::Off);
+        assert_eq!(parsed.draft_update_interval_ms, 1000);
     }
 
     // ── iMessage / Matrix config ────────────────────────────

@@ -2773,8 +2773,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     bot_token: token,
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
+                    allowed_channels: vec![],
                     listen_to_bots: false,
                     mention_only: false,
+                    stream_mode: StreamMode::Off,
+                    draft_update_interval_ms: 1000,
+                    transcription_url: None,
                 });
             }
             2 => {
@@ -5354,7 +5358,7 @@ mod tests {
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("venice".to_string()),
+            default_provider: Some("minimax-cn".to_string()),
             ..Config::default()
         };
 

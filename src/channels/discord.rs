@@ -1,8 +1,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::schema::StreamMode;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::HashMap;
+use std::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -11,9 +14,14 @@ pub struct DiscordChannel {
     bot_token: String,
     guild_id: Option<String>,
     allowed_users: Vec<String>,
+    allowed_channels: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    transcription_url: Option<String>,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stream_mode: StreamMode,
+    draft_update_interval_ms: u64,
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
 }
 
 impl DiscordChannel {
@@ -21,17 +29,35 @@ impl DiscordChannel {
         bot_token: String,
         guild_id: Option<String>,
         allowed_users: Vec<String>,
+        allowed_channels: Vec<String>,
         listen_to_bots: bool,
         mention_only: bool,
+        transcription_url: Option<String>,
     ) -> Self {
         Self {
             bot_token,
             guild_id,
             allowed_users,
+            allowed_channels,
             listen_to_bots,
             mention_only,
+            transcription_url,
             typing_handle: Mutex::new(None),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            last_draft_edit: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure streaming mode for progressive draft updates.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: StreamMode,
+        draft_update_interval_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -182,6 +208,89 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Maximum audio file size accepted for transcription (25 MB, Whisper API limit).
+const MAX_TRANSCRIPTION_BYTES: usize = 25 * 1024 * 1024;
+
+/// Find the first voice/audio attachment in a Discord MESSAGE_CREATE event payload.
+/// Returns `(url, filename)` if found.
+fn find_voice_attachment(d: &serde_json::Value) -> Option<(&str, &str)> {
+    let attachments = d.get("attachments")?.as_array()?;
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if ct.contains("audio/ogg") || ct.contains("audio/mpeg") || ct.contains("audio/mp4") {
+            let url = att.get("url").and_then(|v| v.as_str())?;
+            let filename = att
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("voice.ogg");
+            return Some((url, filename));
+        }
+    }
+    None
+}
+
+/// Download an audio file from Discord CDN and transcribe it via an
+/// OpenAI-compatible Whisper API endpoint.
+async fn transcribe_audio(
+    client: &reqwest::Client,
+    transcription_url: &str,
+    audio_url: &str,
+    filename: &str,
+) -> anyhow::Result<String> {
+    // Download the audio file from Discord CDN
+    let audio_resp = client.get(audio_url).send().await?;
+    if !audio_resp.status().is_success() {
+        anyhow::bail!("failed to download voice attachment");
+    }
+
+    let audio_bytes = audio_resp.bytes().await?;
+    if audio_bytes.len() > MAX_TRANSCRIPTION_BYTES {
+        anyhow::bail!(
+            "voice attachment too large ({} bytes, max {})",
+            audio_bytes.len(),
+            MAX_TRANSCRIPTION_BYTES
+        );
+    }
+
+    // Build multipart form for Whisper API
+    let file_part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+        .file_name(filename.to_string())
+        .mime_str("audio/ogg")?;
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("model", "whisper-1");
+
+    let resp = client
+        .post(transcription_url)
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("transcription API error ({status}): {body}");
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let text = json
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if text.is_empty() {
+        anyhow::bail!("transcription returned empty text");
+    }
+
+    Ok(text)
+}
+
 #[async_trait]
 impl Channel for DiscordChannel {
     fn name(&self) -> &str {
@@ -295,6 +404,7 @@ impl Channel for DiscordChannel {
         });
 
         let guild_filter = self.guild_id.clone();
+        let channel_filter = self.allowed_channels.clone();
 
         loop {
             tokio::select! {
@@ -385,15 +495,47 @@ impl Channel for DiscordChannel {
                         }
                     }
 
-                    let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let text_content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+                    // Transcribe voice attachments when configured
+                    let content = if let Some(ref whisper_url) = self.transcription_url {
+                        if let Some((audio_url, filename)) = find_voice_attachment(d) {
+                            match transcribe_audio(&self.http_client(), whisper_url, audio_url, filename).await {
+                                Ok(transcript) => {
+                                    if text_content.is_empty() {
+                                        format!("[Voice]: {transcript}")
+                                    } else {
+                                        format!("{text_content}\n\n[Voice]: {transcript}")
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Discord: voice transcription failed: {e}");
+                                    if text_content.is_empty() {
+                                        continue;
+                                    }
+                                    text_content.to_string()
+                                }
+                            }
+                        } else {
+                            text_content.to_string()
+                        }
+                    } else {
+                        text_content.to_string()
+                    };
+
                     let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
+                        normalize_incoming_content(&content, self.mention_only, &bot_user_id)
                     else {
                         continue;
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("").to_string();
+
+                    // Channel filter: if allowed_channels is non-empty, only process messages from those channels
+                    if !channel_filter.is_empty() && !channel_filter.iter().any(|c| c == &channel_id) {
+                        continue;
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -467,6 +609,160 @@ impl Channel for DiscordChannel {
         }
         Ok(())
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode != StreamMode::Off
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if self.stream_mode == StreamMode::Off {
+            return Ok(None);
+        }
+
+        let initial_text = if message.content.is_empty() {
+            "...".to_string()
+        } else {
+            message.content.clone()
+        };
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages",
+            message.recipient
+        );
+        let body = json!({ "content": initial_text });
+
+        let resp = self
+            .http_client()
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Discord send draft failed ({status}): {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let message_id = resp_json
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(|id| id.to_string());
+
+        if message_id.is_some() {
+            self.last_draft_edit
+                .lock()
+                .insert(message.recipient.clone(), Instant::now());
+        }
+
+        Ok(message_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit edits per channel
+        {
+            let last_edits = self.last_draft_edit.lock();
+            if let Some(last_time) = last_edits.get(recipient) {
+                let elapsed = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Truncate to Discord's limit (UTF-8 safe, char-based)
+        let display_text = if text.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
+            let end = text
+                .char_indices()
+                .nth(DISCORD_MAX_MESSAGE_LENGTH)
+                .map_or(text.len(), |(idx, _)| idx);
+            &text[..end]
+        } else {
+            text
+        };
+
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages/{}",
+            recipient, message_id
+        );
+        let body = json!({ "content": display_text });
+
+        let resp = self
+            .http_client()
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            self.last_draft_edit
+                .lock()
+                .insert(recipient.to_string(), Instant::now());
+        } else {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Discord edit message failed ({status}): {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Clean up rate-limit tracking
+        self.last_draft_edit.lock().remove(recipient);
+
+        // If text exceeds Discord limit, delete draft and send chunked
+        if text.chars().count() > DISCORD_MAX_MESSAGE_LENGTH {
+            let delete_url = format!(
+                "https://discord.com/api/v10/channels/{}/messages/{}",
+                recipient, message_id
+            );
+            let _ = self
+                .http_client()
+                .delete(&delete_url)
+                .header("Authorization", format!("Bot {}", self.bot_token))
+                .send()
+                .await;
+
+            return self.send(&SendMessage::new(text, recipient)).await;
+        }
+
+        // Edit the draft message with the final content
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages/{}",
+            recipient, message_id
+        );
+        let body = json!({ "content": text });
+
+        let resp = self
+            .http_client()
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .json(&body)
+            .send()
+            .await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        // Edit failed — fall back to new message
+        tracing::warn!("Discord finalize_draft edit failed; falling back to new message");
+        self.send(&SendMessage::new(text, recipient)).await
+    }
 }
 
 #[cfg(test)]
@@ -475,7 +771,7 @@ mod tests {
 
     #[test]
     fn discord_channel_name() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         assert_eq!(ch.name(), "discord");
     }
 
@@ -496,14 +792,22 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         assert!(!ch.is_user_allowed("12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["*".into()], false, false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["*".into()],
+            vec![],
+            false,
+            false,
+            None,
+        );
         assert!(ch.is_user_allowed("12345"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -514,8 +818,10 @@ mod tests {
             "fake".into(),
             None,
             vec!["111".into(), "222".into()],
+            vec![],
             false,
             false,
+            None,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("222"));
@@ -525,7 +831,15 @@ mod tests {
 
     #[test]
     fn allowlist_is_exact_match_not_substring() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into()],
+            vec![],
+            false,
+            false,
+            None,
+        );
         assert!(!ch.is_user_allowed("1111"));
         assert!(!ch.is_user_allowed("11"));
         assert!(!ch.is_user_allowed("0111"));
@@ -533,7 +847,15 @@ mod tests {
 
     #[test]
     fn allowlist_empty_string_user_id() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["111".into()], false, false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["111".into()],
+            vec![],
+            false,
+            false,
+            None,
+        );
         assert!(!ch.is_user_allowed(""));
     }
 
@@ -543,8 +865,10 @@ mod tests {
             "fake".into(),
             None,
             vec!["111".into(), "*".into()],
+            vec![],
             false,
             false,
+            None,
         );
         assert!(ch.is_user_allowed("111"));
         assert!(ch.is_user_allowed("anyone_else"));
@@ -552,7 +876,15 @@ mod tests {
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = DiscordChannel::new("fake".into(), None, vec!["ABC".into()], false, false);
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec!["ABC".into()],
+            vec![],
+            false,
+            false,
+            None,
+        );
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
@@ -752,14 +1084,14 @@ mod tests {
 
     #[test]
     fn typing_handle_starts_as_none() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         let guard = ch.typing_handle.lock();
         assert!(guard.is_none());
     }
 
     #[tokio::test]
     async fn start_typing_sets_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         let _ = ch.start_typing("123456").await;
         let guard = ch.typing_handle.lock();
         assert!(guard.is_some());
@@ -767,7 +1099,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_clears_handle() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         let _ = ch.start_typing("123456").await;
         let _ = ch.stop_typing("123456").await;
         let guard = ch.typing_handle.lock();
@@ -776,14 +1108,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_typing_is_idempotent() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         assert!(ch.stop_typing("123456").await.is_ok());
         assert!(ch.stop_typing("123456").await.is_ok());
     }
 
     #[tokio::test]
     async fn start_typing_replaces_existing_task() {
-        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
         let _ = ch.start_typing("111").await;
         let _ = ch.start_typing("222").await;
         let guard = ch.typing_handle.lock();
@@ -839,5 +1171,119 @@ mod tests {
         assert!(id.starts_with("discord_"));
         // Should have UUID dashes
         assert!(id.contains('-'));
+    }
+
+    // ── Draft / streaming tests ─────────────────────────────
+
+    #[test]
+    fn supports_draft_updates_off_by_default() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
+        assert!(!ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn supports_draft_updates_respects_stream_mode() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None)
+            .with_streaming(StreamMode::Partial, 750);
+        assert!(ch.supports_draft_updates());
+        assert_eq!(ch.draft_update_interval_ms, 750);
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_none_when_stream_mode_off() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
+        let id = ch
+            .send_draft(&SendMessage::new("draft", "123"))
+            .await
+            .unwrap();
+        assert!(id.is_none());
+    }
+
+    #[test]
+    fn last_draft_edit_starts_empty() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
+        assert!(ch.last_draft_edit.lock().is_empty());
+    }
+
+    // ── Voice transcription tests ──────────────────────────────
+
+    #[test]
+    fn discord_channel_stores_transcription_url() {
+        let url = "http://10.0.0.1:8787/v1/audio/transcriptions".to_string();
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            None,
+            vec![],
+            vec![],
+            false,
+            false,
+            Some(url.clone()),
+        );
+        assert_eq!(ch.transcription_url.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn discord_channel_transcription_url_none_by_default() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], vec![], false, false, None);
+        assert!(ch.transcription_url.is_none());
+    }
+
+    #[test]
+    fn find_voice_attachment_detects_ogg() {
+        let d = serde_json::json!({
+            "attachments": [{
+                "content_type": "audio/ogg",
+                "url": "https://cdn.discordapp.com/attachments/voice.ogg",
+                "filename": "voice-message.ogg"
+            }]
+        });
+        let result = find_voice_attachment(&d);
+        assert!(result.is_some());
+        let (url, filename) = result.unwrap();
+        assert!(url.contains("voice.ogg"));
+        assert_eq!(filename, "voice-message.ogg");
+    }
+
+    #[test]
+    fn find_voice_attachment_ignores_non_audio() {
+        let d = serde_json::json!({
+            "attachments": [{
+                "content_type": "image/png",
+                "url": "https://cdn.discordapp.com/attachments/image.png",
+                "filename": "screenshot.png"
+            }]
+        });
+        assert!(find_voice_attachment(&d).is_none());
+    }
+
+    #[test]
+    fn find_voice_attachment_returns_none_without_attachments() {
+        let d = serde_json::json!({"content": "hello"});
+        assert!(find_voice_attachment(&d).is_none());
+    }
+
+    #[test]
+    fn find_voice_attachment_empty_array() {
+        let d = serde_json::json!({"attachments": []});
+        assert!(find_voice_attachment(&d).is_none());
+    }
+
+    #[test]
+    fn transcription_url_config_round_trip() {
+        let toml_with = r#"
+            bot_token = "test"
+            transcription_url = "http://10.0.0.1:8787/v1/audio/transcriptions"
+        "#;
+        let cfg: crate::config::schema::DiscordConfig =
+            toml::from_str(toml_with).expect("should parse with transcription_url");
+        assert_eq!(
+            cfg.transcription_url.as_deref(),
+            Some("http://10.0.0.1:8787/v1/audio/transcriptions")
+        );
+
+        let toml_without = r#"bot_token = "test""#;
+        let cfg: crate::config::schema::DiscordConfig =
+            toml::from_str(toml_without).expect("should parse without transcription_url");
+        assert!(cfg.transcription_url.is_none());
     }
 }

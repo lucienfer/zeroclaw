@@ -118,6 +118,7 @@ struct ChannelRuntimeContext {
     temperature: f64,
     auto_save_memory: bool,
     max_tool_iterations: usize,
+    native_tools: bool,
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     provider_cache: ProviderCacheMap,
@@ -652,7 +653,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
-                .send_draft(&SendMessage::new("...", &msg.reply_target))
+                .send_draft(&SendMessage::new("🧠 Thinking...", &msg.reply_target))
                 .await
             {
                 Ok(id) => id,
@@ -718,6 +719,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             msg.channel.as_str(),
             ctx.max_tool_iterations,
             delta_tx,
+            ctx.native_tools,
         ),
     )
     .await;
@@ -902,20 +904,8 @@ pub fn build_system_prompt(
     let mut prompt = String::with_capacity(8192);
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
-        prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
-        }
-        prompt.push_str("\n## Tool Use Protocol\n\n");
-        prompt.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-        prompt.push_str("You may use multiple tool calls in a single response. ");
-        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
-        prompt
-            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
-    }
+    // Tool list + protocol is injected later by build_tool_instructions().
+    // Only emit a compact summary here for context.
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
     let has_hardware = tools.iter().any(|(name, _)| {
@@ -943,7 +933,7 @@ pub fn build_system_prompt(
         "## Your Task\n\n\
          When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
          Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+         Instead: emit actual tool-call tags when you need to act. Just do what they ask.\n\n",
     );
 
     // ── 2. Safety ───────────────────────────────────────────────
@@ -1327,13 +1317,18 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref dc) = config.channels_config.discord {
         channels.push((
             "Discord",
-            Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.allowed_channels.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                    dc.transcription_url.clone(),
+                )
+                .with_streaming(dc.stream_mode, dc.draft_update_interval_ms),
+            ),
         ));
     }
 
@@ -1663,13 +1658,18 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref dc) = config.channels_config.discord {
-        channels.push(Arc::new(DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_id.clone(),
-            dc.allowed_users.clone(),
-            dc.listen_to_bots,
-            dc.mention_only,
-        )));
+        channels.push(Arc::new(
+            DiscordChannel::new(
+                dc.bot_token.clone(),
+                dc.guild_id.clone(),
+                dc.allowed_users.clone(),
+                dc.allowed_channels.clone(),
+                dc.listen_to_bots,
+                dc.mention_only,
+                dc.transcription_url.clone(),
+            )
+            .with_streaming(dc.stream_mode, dc.draft_update_interval_ms),
+        ));
     }
 
     if let Some(ref sl) = config.channels_config.slack {
@@ -1854,6 +1854,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
+        native_tools: config.agent.native_tools,
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
@@ -2258,6 +2259,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2311,6 +2313,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2373,6 +2376,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
@@ -2456,6 +2460,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
@@ -2515,6 +2520,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 12,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2569,6 +2575,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 3,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2674,6 +2681,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2745,6 +2753,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 10,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2783,7 +2792,7 @@ mod tests {
         let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
 
         // Section headers
-        assert!(prompt.contains("## Tools"), "missing Tools section");
+        // Note: ## Tools / Tool Use Protocol is now emitted by build_tool_instructions(), not build_system_prompt()
         assert!(prompt.contains("## Safety"), "missing Safety section");
         assert!(prompt.contains("## Workspace"), "missing Workspace section");
         assert!(
@@ -2798,7 +2807,9 @@ mod tests {
     }
 
     #[test]
-    fn prompt_injects_tools() {
+    fn prompt_does_not_duplicate_tool_protocol() {
+        // build_system_prompt no longer emits ## Tools or ## Tool Use Protocol —
+        // that is handled exclusively by build_tool_instructions().
         let ws = make_workspace();
         let tools = vec![
             ("shell", "Run commands"),
@@ -2806,9 +2817,10 @@ mod tests {
         ];
         let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
 
-        assert!(prompt.contains("**shell**"));
-        assert!(prompt.contains("Run commands"));
-        assert!(prompt.contains("**memory_recall**"));
+        assert!(
+            !prompt.contains("## Tool Use Protocol"),
+            "build_system_prompt should not emit Tool Use Protocol (handled by build_tool_instructions)"
+        );
     }
 
     #[test]
@@ -3136,6 +3148,7 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             max_tool_iterations: 5,
+            native_tools: true,
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
