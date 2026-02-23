@@ -312,6 +312,31 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
     }
 
     let arguments = parse_arguments_value(value.get("arguments"));
+
+    // Fallback: if `arguments` is missing or empty, collect all top-level fields
+    // except `name` as the arguments object. This handles models that generate
+    // {"name": "shell", "command": "date"} instead of the canonical
+    // {"name": "shell", "arguments": {"command": "date"}} format.
+    let arguments = if arguments.as_object().is_some_and(|o| o.is_empty()) {
+        if let Some(obj) = value.as_object() {
+            let mut args_map = serde_json::Map::new();
+            for (k, v) in obj {
+                if k != "name" && k != "arguments" {
+                    args_map.insert(k.clone(), v.clone());
+                }
+            }
+            if args_map.is_empty() {
+                arguments
+            } else {
+                serde_json::Value::Object(args_map)
+            }
+        } else {
+            arguments
+        }
+    } else {
+        arguments
+    };
+
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -729,6 +754,24 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Claude Code XML format: <function_calls><invoke name="tool_name"><parameter name="param">value</parameter></invoke></function_calls>
+    // Some proxies (CLIProxy) cause the model to use this format instead of <tool_call> JSON.
+    if calls.is_empty() {
+        let fc_calls = parse_function_calls_xml(remaining);
+        if !fc_calls.is_empty() {
+            // Strip <function_calls>...</function_calls> wrapper blocks and bare <invoke name="...">...</invoke> blocks
+            static FC_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r#"(?s)<function_calls>.*?</function_calls>|<invoke\s+name\s*=\s*"[^"]+"\s*>.*?</invoke>"#).unwrap()
+            });
+            let cleaned_text = FC_BLOCK_RE.replace_all(remaining, "").to_string();
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            calls.extend(fc_calls);
+            remaining = "";
+        }
+    }
+
     // SECURITY: We do NOT fall back to extracting arbitrary JSON from the response
     // here. That would enable prompt injection attacks where malicious content
     // (e.g., in emails, files, or web pages) could include JSON that mimics a
@@ -737,6 +780,7 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     // 2. ZeroClaw tool-call tags (<tool_call>, <toolcall>, <tool-call>)
     // 3. Markdown code blocks with tool_call/toolcall/tool-call language
     // 4. Explicit GLM line-based call formats (e.g. `shell/command>...`)
+    // 5. Claude Code XML format (<function_calls>/<invoke name="...">)
     // This ensures only the LLM's intentional tool calls are executed.
 
     // Remaining text after last tool call
@@ -756,6 +800,53 @@ fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect()
+}
+
+/// Parse Claude Code XML format tool calls:
+/// `<function_calls><invoke name="tool_name"><parameter name="param">value</parameter></invoke></function_calls>`
+///
+/// Some proxy setups cause the model to emit this format instead of `<tool_call>` JSON.
+/// Also handles bare `<invoke name="...">` without the `<function_calls>` wrapper.
+fn parse_function_calls_xml(text: &str) -> Vec<ParsedToolCall> {
+    static INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<invoke\s+name\s*=\s*"([^"]+)"\s*>(.*?)</invoke>"#).unwrap()
+    });
+    static PARAM_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)<parameter\s+name\s*=\s*"([^"]+)"\s*>(.*?)</parameter>"#).unwrap()
+    });
+
+    let mut calls = Vec::new();
+
+    for invoke_cap in INVOKE_RE.captures_iter(text) {
+        let raw_name = invoke_cap[1].trim().to_string();
+        let body = &invoke_cap[2];
+
+        // Map common Claude Code tool names to ZeroClaw tool names
+        let name = match raw_name.as_str() {
+            "bash" | "Bash" => "shell".to_string(),
+            "cat" | "Read" | "read" | "read_file" => "file_read".to_string(),
+            "write" | "Write" | "write_file" => "file_write".to_string(),
+            other => other.to_string(),
+        };
+
+        let mut args = serde_json::Map::new();
+        for param_cap in PARAM_RE.captures_iter(body) {
+            let param_name = param_cap[1].trim().to_string();
+            let param_value = param_cap[2].trim().to_string();
+
+            // Try parsing as JSON first (for numbers, booleans, arrays, objects)
+            let json_value = serde_json::from_str::<serde_json::Value>(&param_value)
+                .unwrap_or_else(|_| serde_json::Value::String(param_value));
+            args.insert(param_name, json_value);
+        }
+
+        calls.push(ParsedToolCall {
+            name,
+            arguments: serde_json::Value::Object(args),
+        });
+    }
+
+    calls
 }
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -841,6 +932,7 @@ pub(crate) async fn agent_turn(
         "channel",
         max_tool_iterations,
         None,
+        true,
     )
     .await
 }
@@ -861,6 +953,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     max_tool_iterations: usize,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    native_tools: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -870,7 +963,8 @@ pub(crate) async fn run_tool_call_loop(
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+    let use_native_tools =
+        native_tools && provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
@@ -1026,6 +1120,10 @@ pub(crate) async fn run_tool_call_loop(
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
+            // Send tool progress through streaming channel for draft updates
+            if let Some(ref tx) = on_delta {
+                let _ = tx.send(format!("\u{1f527} {}...\n", call.name)).await;
+            }
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
@@ -1088,10 +1186,11 @@ pub(crate) async fn run_tool_call_loop(
 pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+    instructions.push_str("To use a tool, use one of these formats:\n\n");
+    instructions.push_str("Format 1 (preferred):\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+    instructions.push_str("Format 2 (also accepted):\n```\n<function_calls>\n<invoke name=\"tool_name\">\n<parameter name=\"param\">value</parameter>\n</invoke>\n</function_calls>\n```\n\n");
     instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
+        "CRITICAL: Output actual tool-call tags — never describe steps or give examples.\n\n",
     );
     instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
@@ -1398,6 +1497,7 @@ pub async fn run(
             "cli",
             config.agent.max_tool_iterations,
             None,
+            config.agent.native_tools,
         )
         .await?;
         final_output = response.clone();
@@ -1524,6 +1624,7 @@ pub async fn run(
                 "cli",
                 config.agent.max_tool_iterations,
                 None,
+                config.agent.native_tools,
             )
             .await
             {
@@ -2510,5 +2611,116 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "pwd");
         assert_eq!(text, "Done");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Claude Code XML Format (<function_calls>/<invoke>) Parsing
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_function_calls_xml_basic() {
+        let text = r#"<function_calls>
+<invoke name="shell">
+<parameter name="command">ls -la</parameter>
+</invoke>
+</function_calls>"#;
+        let calls = parse_function_calls_xml(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn parse_function_calls_xml_maps_bash_to_shell() {
+        let text = r#"<invoke name="bash">
+<parameter name="command">date +%s</parameter>
+</invoke>"#;
+        let calls = parse_function_calls_xml(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "date +%s");
+    }
+
+    #[test]
+    fn parse_function_calls_xml_maps_read_to_file_read() {
+        let text = r#"<invoke name="Read">
+<parameter name="file_path">/tmp/test.txt</parameter>
+</invoke>"#;
+        let calls = parse_function_calls_xml(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(calls[0].arguments["file_path"], "/tmp/test.txt");
+    }
+
+    #[test]
+    fn parse_function_calls_xml_multiple_params() {
+        let text = r#"<function_calls>
+<invoke name="http_request">
+<parameter name="url">https://api.example.com</parameter>
+<parameter name="method">POST</parameter>
+<parameter name="body">{"key":"value"}</parameter>
+</invoke>
+</function_calls>"#;
+        let calls = parse_function_calls_xml(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "http_request");
+        assert_eq!(calls[0].arguments["url"], "https://api.example.com");
+        assert_eq!(calls[0].arguments["method"], "POST");
+    }
+
+    #[test]
+    fn parse_function_calls_xml_multiple_invocations() {
+        let text = r#"<function_calls>
+<invoke name="bash">
+<parameter name="command">ls</parameter>
+</invoke>
+<invoke name="bash">
+<parameter name="command">pwd</parameter>
+</invoke>
+</function_calls>"#;
+        let calls = parse_function_calls_xml(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["command"], "ls");
+        assert_eq!(calls[1].arguments["command"], "pwd");
+    }
+
+    #[test]
+    fn parse_function_calls_xml_no_match() {
+        let text = "Just some regular text with no tool calls.";
+        let calls = parse_function_calls_xml(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_function_calls_xml_integration() {
+        // Integration: parse_tool_calls should pick up Claude Code XML format
+        let response = r#"Let me check the files.
+<function_calls>
+<invoke name="bash">
+<parameter name="command">ls -la repos/</parameter>
+</invoke>
+</function_calls>"#;
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la repos/");
+        assert!(text.contains("Let me check the files"));
+    }
+
+    #[test]
+    fn parse_function_calls_xml_strips_blocks_from_text() {
+        let response = r#"Before text.
+<function_calls>
+<invoke name="bash">
+<parameter name="command">echo hello</parameter>
+</invoke>
+</function_calls>
+After text."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert!(text.contains("Before text"));
+        assert!(text.contains("After text"));
+        assert!(!text.contains("function_calls"));
+        assert!(!text.contains("invoke"));
     }
 }
